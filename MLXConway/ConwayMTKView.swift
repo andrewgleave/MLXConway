@@ -28,14 +28,15 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
     
-    // Track last point for smooth drawing
-    private var lastPoint: CGPoint?
+    // last touch/down point
+    private var lastTouchPoint: CGPoint?
     
     private struct Vertex {
         var position: SIMD2<Float>
         var texCoord: SIMD2<Float>
     }
     
+    // quad vertices
     private static let vertices: [Vertex] = [
         Vertex(position: SIMD2(-1, -1), texCoord: SIMD2(0, 1)),
         Vertex(position: SIMD2(1, -1),  texCoord: SIMD2(1, 1)),
@@ -47,7 +48,7 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
     
     weak var simulationModel: ConwayModel? {
         didSet {
-            initBuffers()
+            createPixelBuffer()
         }
     }
     
@@ -62,13 +63,13 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
         device = MTLCreateSystemDefaultDevice()!
         commonInit()
     }
-    private func initBuffers() {
+    
+    private func createPixelBuffer() {
         guard let model = simulationModel,
               let device = device else { return }
         
         simulationWidth = model.grid.shape[1]
         simulationHeight = model.grid.shape[0]
-        
         pixelBuffer = device.makeBuffer(length: simulationWidth * simulationHeight, 
                                       options: .storageModeShared)
         
@@ -83,14 +84,15 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
     }
     
     private func commonInit() {
-        colorPixelFormat = .bgra8Unorm
+        colorPixelFormat = .r8Unorm
         delegate = self
+        
         commandQueue = device?.makeCommandQueue()
         createVertexBuffer()
         createPipelineState()
         
+        // mouse and touch tracking
         #if os(macOS)
-            // Enable mouse tracking for macOS
             let trackingArea = NSTrackingArea(
                 rect: .zero,
                 options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
@@ -99,7 +101,6 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
             )
             addTrackingArea(trackingArea)
         #else
-            // Enable touch tracking for iOS
             let panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
             let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             addGestureRecognizer(panGesture)
@@ -147,56 +148,54 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
               let pixelTexture = pixelTexture,
               let pixelBuffer = pixelBuffer else { return }
         
-        // Update simulation
         model.step()
-        let one = MLXArray(1).asType(.int8)
-        let inverted = one - model.grid
-        let uint8Grid = (inverted.asType(.uint8)) * 255
-        let data = uint8Grid.asData(access: .copy).data
         
-        // Update pixel buffer
-        data.withUnsafeBytes { ptr in
-            if let baseAddress = ptr.baseAddress {
-                memcpy(pixelBuffer.contents(), baseAddress, model.grid.shape[1] * model.grid.shape[0])
-            }
+        // invert grid
+        let gridData = (1 - model.grid.asType(.uint8)) * 255
+        
+        gridData.asData(access: .copy).data.withUnsafeBytes { ptr in
+            guard let baseAddress = ptr.baseAddress else { return }
+            memcpy(pixelBuffer.contents(), 
+                   baseAddress, 
+                   simulationWidth * simulationHeight)
         }
         
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return }
         
-        // Copy buffer to texture using blit encoder
-        if let blitEncoder = commandBuffer.makeBlitCommandEncoder() {
-            blitEncoder.copy(
-                from: pixelBuffer,
-                sourceOffset: 0,
-                sourceBytesPerRow: simulationWidth,
-                sourceBytesPerImage: simulationWidth * simulationHeight,
-                sourceSize: MTLSizeMake(simulationWidth, simulationHeight, 1),
-                to: pixelTexture,
-                destinationSlice: 0,
-                destinationLevel: 0,
-                destinationOrigin: MTLOriginMake(0, 0, 0)
-            )
-            blitEncoder.endEncoding()
+        // copy to texture
+        blitEncoder.copy(
+            from: pixelBuffer,
+            sourceOffset: 0,
+            sourceBytesPerRow: simulationWidth,
+            sourceBytesPerImage: simulationWidth * simulationHeight,
+            sourceSize: MTLSizeMake(simulationWidth, simulationHeight, 1),
+            to: pixelTexture,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: MTLOriginMake(0, 0, 0)
+        )
+        blitEncoder.endEncoding()
+        
+        // render
+        if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
+            encoder.setRenderPipelineState(pipelineState)
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setFragmentTexture(pixelTexture, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            encoder.endEncoding()
         }
-        
-        // Render to screen
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
-        encoder.setRenderPipelineState(pipelineState)
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        encoder.setFragmentTexture(pixelTexture, index: 0)
-        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: Self.vertices.count)
-        encoder.endEncoding()
         
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
     
-    // Convert view coordinates to grid coordinates
+    // convert view coordinates to grid coordinates
     private func gridCoordinates(from point: CGPoint) -> (x: Int, y: Int)? {
         guard let model = simulationModel else { return nil }
         
         #if os(macOS)
-        let normalizedY = 1.0 - (point.y / bounds.height)  // Flip Y for macOS
+        let normalizedY = 1.0 - (point.y / bounds.height)  // flip for mac
         #else
         let normalizedY = point.y / bounds.height
         #endif
@@ -221,24 +220,24 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
         model.grid[y, x] = value
     }
     
-    // Set cells alive in a radius around a point
-    private func setCellsAlive(at point: CGPoint) {
+    // draw live cells
+    private func drawCells(at point: CGPoint, radius: Int = 1) {
         guard let (gridX, gridY) = gridCoordinates(from: point) else { return }
         
         let alive = MLXArray(1).asType(.int8)
-        for dy in -spawnRadius...spawnRadius {
-            for dx in -spawnRadius...spawnRadius {
+        for dy in -radius...radius {
+            for dx in -radius...radius {
                 setGridCell(alive, at: gridX + dx, y: gridY + dy)
             }
         }
     }
     
-    // Draw a line of live cells between two points
+    // draw live cells between two points
     private func drawLine(from start: CGPoint, to end: CGPoint) {
         guard let (startX, startY) = gridCoordinates(from: start),
               let (endX, endY) = gridCoordinates(from: end) else { return }
         
-        // Use Bresenham's line algorithm
+        // use Bresenham's line algorithm
         var x = startX
         var y = startY
         let dx = abs(endX - startX)
@@ -251,7 +250,7 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
         let radius = 1
         
         while true {
-            // Set cells alive in a radius around the current point
+            // set cells alive in a radius around the current point
             for dy in -radius...radius {
                 for dx in -radius...radius {
                     setGridCell(alive, at: x + dx, y: y + dy)
@@ -275,20 +274,20 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
     #if os(macOS)
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        lastPoint = point
-        setCellsAlive(at: point)
+        lastTouchPoint = point
+        drawCells(at: point, radius: spawnRadius)
     }
     
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if let last = lastPoint {
+        if let last = lastTouchPoint {
             drawLine(from: last, to: point)
         }
-        lastPoint = point
+        lastTouchPoint = point
     }
     
     override func mouseUp(with event: NSEvent) {
-        lastPoint = nil
+        lastTouchPoint = nil
     }
     #else
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
@@ -296,23 +295,22 @@ class ConwayMTKView: MTKView, MTKViewDelegate {
         
         switch gesture.state {
         case .began:
-            lastPoint = point
-            setCellsAlive(at: point)
+            lastTouchPoint = point
+            drawCells(at: point, radius: spawnRadius)
         case .changed:
-            if let last = lastPoint {
+            if let last = lastTouchPoint {
                 drawLine(from: last, to: point)
             }
-            lastPoint = point
+            lastTouchPoint = point
         case .ended, .cancelled:
-            lastPoint = nil
+            lastTouchPoint = nil
         default:
             break
         }
     }
     
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        let point = gesture.location(in: self)
-        setCellsAlive(at: point)
+        drawCells(at: gesture.location(in: self), radius: spawnRadius)
     }
     #endif
 } 
