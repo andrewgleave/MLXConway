@@ -32,7 +32,7 @@ let conwayKernelSource = """
 
 class ConwayModel {
     var grid: MLXArray
-    let kernel: MLXFastKernel
+    let kernel: MLXFast.MLXFastKernel
     let gridWidth: Int
     let gridHeight: Int
     
@@ -40,23 +40,23 @@ class ConwayModel {
         self.gridWidth = Int(gridSize.width * scale)
         self.gridHeight = Int(gridSize.height * scale)
         
-        let randomGrid = MLXRandom.bernoulli(0.3, [gridHeight, gridWidth])
-        self.grid = randomGrid.asType(.int8)
+        // create initial grid
+        self.grid = MLXRandom.bernoulli(0.3, [gridHeight, gridWidth]).asType(.int8)
         
         self.kernel = metalKernel(
             name: "conway",
             inputNames: ["grid"],
             outputNames: ["out"],
             source: conwayKernelSource,
-            grid: (gridHeight, gridWidth, 1),
-            threadGroup: (2, 512, 1),
-            outputShapes: [grid.shape],
-            outputDTypes: [grid.dtype]
         )
     }
 
+    func reset(probability: Float = 0.3) {
+        grid = MLXRandom.bernoulli(probability, [gridHeight, gridWidth]).asType(.int8)
+    }
+
     func step() {
-        let outputs = kernel([grid])
+        let outputs = kernel([grid], grid: (gridHeight, gridWidth, 1), threadGroup: (2, 512, 1), outputShapes: [grid.shape], outputDTypes: [grid.dtype])
         grid = outputs[0]
     }
 }
